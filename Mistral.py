@@ -1,0 +1,1846 @@
+__version__ = ("1", "0", "0")
+
+"""￣へ￣"""
+
+# meta developer: @AIekseyNavalniy
+# requires: markdown-it-py pytz httpx aiohttp Pillow telethon
+
+import re
+import os
+import io
+import random
+import socket
+import base64
+import uuid
+import json
+import asyncio
+import logging
+import tempfile
+import time
+import aiohttp
+from markdown_it import MarkdownIt
+import pytz
+import httpx
+
+from PIL import Image
+from datetime import datetime
+from telethon import types as tg_types
+from telethon.tl.types import Message, DocumentAttributeFilename, DocumentAttributeSticker
+from telethon.utils import get_display_name, get_peer_id
+from telethon.errors.rpcerrorlist import (
+    MessageTooLongError,
+    ChatAdminRequiredError,
+    UserNotParticipantError,
+    ChannelPrivateError
+)
+
+from .. import loader, utils
+from ..inline.types import InlineCall
+
+logger = logging.getLogger(__name__)
+
+_mistral_log_client = None
+_mistral_log_channel = None
+_mistral_log_topic_id = None
+
+class _MistralTopicHandler(logging.Handler):
+    def emit(self, record):
+        if _mistral_log_client is None or _mistral_log_channel is None or _mistral_log_topic_id is None:
+            return
+        try:
+            text = f"<code>[{record.levelname}]</code> {self.format(record)}"
+            asyncio.ensure_future(
+                _mistral_log_client.send_message(
+                    int(f"-100{_mistral_log_channel}"),
+                    text,
+                    parse_mode="html",
+                    reply_to=_mistral_log_topic_id,
+                )
+            )
+        except Exception:
+            pass
+
+_mistral_topic_handler = _MistralTopicHandler()
+_mistral_topic_handler.setLevel(logging.WARNING)
+logger.addHandler(_mistral_topic_handler)
+
+DB_HISTORY_KEY = "mistral_conversations_v1"
+DB_MAUTO_HISTORY_KEY = "mistral_mauto_conversations_v1"
+DB_IMPERSONATION_KEY = "mistral_impersonation_chats"
+DB_PRESETS_KEY = "mistral_prompt_presets"
+DB_PAGER_CACHE_KEY = "mistral_pager_cache"
+DB_KEY_MAP_KEY = "mistral_key_model_map"
+DB_MEMORY_DISABLED_KEY = "mistral_memory_disabled_chats"
+DB_SESSION_STATS_KEY = "mistral_session_stats_v1"
+DB_PROVIDER_MODELS_KEY = "mistral_provider_models_v1"
+MISTRAL_TIMEOUT = 840
+MAX_FFMPEG_SIZE = 90 * 1024 * 1024
+MODEL_PROFILE_CHOICES = ("auto", "balanced", "fast", "reasoning", "coding", "vision", "manual")
+
+MISTRAL_API_BASE = "https://api.mistral.ai/v1"
+
+class Mistral(loader.Module):
+    """Модуль для работы с Mistral AI. (Сделано на базе Gemini от @SenkoGuardianModules)"""
+    strings = {
+        "name": "Mistral",
+        "cfg_api_key_doc": "API ключи Mistral AI, разделенные запятой. Будут скрыты.",
+        "cfg_model_name_doc": "Модель Mistral AI.",
+        "cfg_buttons_doc": "Включить интерактивные кнопки.",
+        "cfg_system_instruction_doc": "Системная инструкция (промпт) для Mistral.",
+        "cfg_max_history_length_doc": "Макс. кол-во пар 'вопрос-ответ' в памяти (0 - без лимита).",
+        "cfg_timezone_doc": "Ваш часовой пояс. Список: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+        "cfg_proxy_doc": "Прокси для обхода региональных блокировок. Формат: http://user:pass@host:port",
+        "cfg_impersonation_prompt_doc": "Промпт для режима авто-ответа. {my_name} и {chat_history} будут заменены.",
+        "cfg_impersonation_history_limit_doc": "Сколько последних сообщений из чата отправлять в качестве контекста для авто-ответа.",
+        "cfg_impersonation_reply_chance_doc": "Вероятность ответа в режиме mauto (от 0.0 до 1.0). 0.2 = 20% шанс.",
+        "cfg_temperature_doc": "Температура генерации (креативность). От 0.0 до 1.0. По умолчанию 0.7.",
+        "cfg_inline_pagination_doc": "Использовать инлайн-кнопки для длинных ответов.",
+        "cfg_global_memory_doc": "Включить ОБЩУЮ память для всех чатов.",
+        "cfg_show_tokens_doc": "Показывать токены в ответе, если провайдер их вернул.",
+        "cfg_show_time_doc": "Показывать время выполнения запроса.",
+        "cfg_auto_model_doc": "Автоматически подбирать модель по профилю и запросу.",
+        "cfg_model_profile_doc": "Профиль модели: auto, balanced, fast, reasoning, coding, vision, manual.",
+        "no_api_key": (
+            '❗️ <b>Api ключ(и) не настроен(ы).</b>\nПолучить Api ключ можно <a href="https://console.mistral.ai/api-keys/">здесь</a>.\n'
+            '<b>Добавьте ключ(и) в конфиге модуля:</b> <code>.cfg Mistral api_key</code>\n'
+        ),
+        "invalid_api_key": '❗️ <b>Предоставленный API ключ недействителен.</b>\nУбедитесь, что он правильно скопирован из <a href="https://console.mistral.ai/api-keys/">Mistral Console</a>.',
+        "all_keys_exhausted": "❗️ <b>Все доступные API ключи ({}) исчерпали свою квоту.</b>\nПопробуйте позже или добавьте новые ключи в конфиге: <code>.cfg Mistral api_key</code>",
+        "no_prompt_or_media": "⚠️ <i>Нужен текст или ответ на медиа/файл.</i>",
+        "processing": "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Обработка...</b>",
+        "api_error": "❗️ <b>Ошибка Mistral API:</b>\n<code>{}</code>",
+        "api_timeout": f"❗️ <b>Таймаут ответа от Mistral API ({MISTRAL_TIMEOUT} сек).</b>",
+        "blocked_error": "🚫 <b>Запрос/ответ заблокирован.</b>\n<code>{}</code>",
+        "generic_error": "❗️ <b>Ошибка:</b>\n<code>{}</code>",
+        "question_prefix": "💬 <b>Запрос:</b>",
+        "response_prefix": "<emoji document_id=5325547803936572038>✨</emoji> <b>Mistral:</b>",
+        "unsupported_media_type": "⚠️ <b>Формат медиа ({}) не поддерживается.</b>",
+        "memory_status": "🧠 [{}/{}]",
+        "memory_status_unlimited": "🧠 [{}/∞]",
+        "memory_status_global": "🧠 [🌍 GLOBAL/{}]",
+        "memory_cleared": "🧹 <b>Память диалога очищена.</b>",
+        "memory_cleared_global": "🧹 <b>Глобальная память очищена.</b>",
+        "memory_cleared_mauto": "🧹 <b>Память mauto в этом чате очищена.</b>",
+        "no_memory_to_clear": "ℹ️ <b>В этом чате нет истории.</b>",
+        "mres_global_cleared": "🧹 <b>Вся глобальная память очищена.</b>",
+        "mres_no_global": "ℹ️ <b>Глобальная память и так пуста.</b>",
+        "no_mauto_memory_to_clear": "ℹ️ <b>В этом чате нет истории mauto.</b>",
+        "memory_chats_title": "🧠 <b>Чаты с историей ({}):</b>",
+        "memory_chat_line": "  • {} (<code>{}</code>)",
+        "no_memory_found": "ℹ️ Память Mistral пуста.",
+        "media_reply_placeholder": "[ответ на медиа]",
+        "btn_clear": "🧹 Очистить",
+        "btn_regenerate": "🔄 Другой ответ",
+        "no_last_request": "Последний запрос не найден для повторной генерации.",
+        "memory_fully_cleared": "🧹 <b>Вся память Mistral полностью очищена (затронуто {} чатов).</b>",
+        "mauto_memory_fully_cleared": "🧹 <b>Вся память mauto полностью очищена (затронуто {} чатов).</b>",
+        "no_memory_to_fully_clear": "ℹ️ <b>Память Mistral и так пуста.</b>",
+        "no_mauto_memory_to_fully_clear": "ℹ️ <b>Память mauto и так пуста.</b>",
+        "response_too_long": "Ответ Mistral был слишком длинным и отправлен в виде файла.",
+        "mclear_usage": "ℹ️ <b>Использование:</b> <code>.mclear [global/auto]</code>",
+        "mres_usage": "ℹ️ <b>Использование:</b> <code>.mres [global/auto]</code>",
+        "auto_mode_on": "🎭 <b>Режим авто-ответа включен в этом чате.</b>\nЯ буду отвечать на сообщения с вероятностью {}%.",
+        "auto_mode_off": "🎭 <b>Режим авто-ответа выключен в этом чате.</b>",
+        "auto_mode_chats_title": "🎭 <b>Чаты с активным авто-ответом ({}):</b>",
+        "no_auto_mode_chats": "ℹ️ Нет чатов с включенным режимом авто-ответа.",
+        "auto_mode_usage": "ℹ️ <b>Использование:</b> <code>.mauto on/off или [id/username] [on/off]</code>",
+        "mauto_chat_not_found": "🚫 <b>Не удалось найти чат:</b> <code>{}</code>",
+        "mauto_state_updated": "🎭 <b>Режим авто-ответа для чата {} {}</b>",
+        "mauto_enabled": "включен",
+        "mauto_disabled": "выключен",
+        "mch_usage": "ℹ️ <b>Использование:</b>\n<code>.mch <кол-во> <вопрос></code>\n<code>.mch <id чата> <кол-во> <вопрос></code>",
+        "mch_processing": "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Анализирую {} сообщений...</b>",
+        "mch_result_caption": "Анализ последних {} сообщений",
+        "mch_result_caption_from_chat": "Анализ последних {} сообщений из чата <b>{}</b>",
+        "mch_invalid_args": "❗️ <b>Неверные аргументы.</b>\n{}",
+        "mch_chat_error": "❗️ <b>Ошибка доступа к чату</b> <code>{}</code>: <i>{}</i>",
+        "mask_no_prompt": "⚠️ <b>Введите вопрос или ответьте командой на сообщение.</b>",
+        "mprofile_usage": "ℹ️ <b>Использование:</b> <code>.mprofile [auto|balanced|fast|reasoning|coding|vision|manual]</code>",
+        "mprofile_set": "✅ <b>Профиль модели:</b> <code>{}</code>\n🧠 <b>Текущая модель:</b> <code>{}</code>",
+        "mmodel_usage": "ℹ️ <b>Использование:</b> <code>.mmodel [модель] [--s|-s]</code>\n• [модель] — установить модель.\n• --s/-s — показать список доступных моделей.",
+        "mmodel_list_title": "📋 <b>Доступные модели Mistral (по вашему API):</b>",
+        "mmodel_no_models": "⚠️ Не удалось получить список моделей.",
+        "mmodel_list_error": "❗️ Ошибка получения списка: {}",
+        "mme_chat_not_found": "🚫 <b>Не удалось найти чат для экспорта:</b> <code>{}</code>",
+        "mme_sent_to_saved": "💾 История экспортирована в избранное.",
+        "mprompt_usage": "ℹ️ <b>Использование:</b>\n<code>.mprompt <текст/пресет></code> — установить.\n<code>.mprompt -c</code> — очистить.\n<code>.mpresets</code> — база пресетов.",
+        "mprompt_updated": "✅ <b>Системный промпт обновлен!</b>\nДлина: {} символов.",
+        "mprompt_cleared": "🗑 <b>Системный промпт очищен.</b>",
+        "mprompt_current": "📝 <b>Текущий системный промпт:</b>",
+        "mprompt_file_error": "❗️ <b>Ошибка чтения файла:</b> {}",
+        "mprompt_file_too_big": "❗️ <b>Файл слишком большой</b> (лимит 1 МБ).",
+        "mprompt_not_text": "❗️ Это не похоже на текстовый файл.(txt)",
+        "mpresets_usage": (
+            "ℹ️ <b>Управление пресетами:</b>\n"
+            "• <code>.mpresets save [Имя] текст</code> — сохранить (имя в скобках, если с пробелами).\n"
+            "• <code>.mpresets load 1</code> или <code>имя</code> — загрузить по номеру/имени.\n"
+            "• <code>.mpresets del 1</code> или <code>имя</code> — удалить.\n"
+            "• <code>.mpresets list</code> — список."
+        ),
+        "mpreset_loaded": "✅ <b>Установлен пресет:</b> [<code>{}</code>]\nДлина: {} симв.",
+        "mpreset_saved": "💾 <b>Пресет сохранен!</b>\n🏷 <b>Имя:</b> {}\n№ <b>Индекс:</b> {}",
+        "mpreset_deleted": "🗑 <b>Пресет удален:</b> {}",
+        "mpreset_not_found": "🚫 Пресет с таким именем или индексом не найден.",
+        "mpreset_list_head": "📋 <b>Ваши пресеты:</b>\n",
+        "mpreset_empty": "📂 Список пресетов пуст.",
+        "mcfg_usage": "ℹ️ <b>Использование:</b> <code>.mcfg [параметр] [значение]</code>\nДоступные параметры: api_key, model_name, system_instruction, temperature, max_history_length, timezone, proxy, impersonation_reply_chance, impersonation_history_limit",
+        "mcfg_set": "✅ <b>Параметр <code>{}</code> установлен.</b>",
+        "mcfg_unknown": "❗️ <b>Неизвестный параметр:</b> <code>{}</code>\nДоступные: api_key, model_name, system_instruction, temperature, max_history_length, timezone, proxy, impersonation_reply_chance, impersonation_history_limit",
+    }
+
+    TEXT_MIME_TYPES = {
+        "text/plain", "text/markdown", "text/html", "text/css", "text/csv",
+        "application/json", "application/xml", "application/x-python", "text/x-python",
+        "application/javascript", "application/x-sh",
+    }
+
+    PROVIDER_SPECS = {
+        "mistral": {
+            "label": "Mistral",
+            "default_model": "mistral-large-latest",
+            "docs_url": "https://docs.mistral.ai/getting-started/models/",
+            "profiles": {
+                "balanced": "mistral-large-latest",
+                "fast": "mistral-small-latest",
+                "reasoning": "mistral-large-latest",
+                "coding": "codestral-latest",
+                "vision": "pixtral-large-latest",
+            },
+            "fallback_models": (
+                "mistral-large-latest",
+                "mistral-small-latest",
+                "mistral-medium-latest",
+                "codestral-latest",
+                "pixtral-large-latest",
+                "open-mistral-nemo",
+                "open-codestral-mamba",
+            ),
+        },
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue("api_key", "", self.strings["cfg_api_key_doc"], validator=loader.validators.Hidden()),
+            loader.ConfigValue("model_name", "mistral-large-latest", self.strings["cfg_model_name_doc"]),
+            loader.ConfigValue("interactive_buttons", True, self.strings["cfg_buttons_doc"], validator=loader.validators.Boolean()),
+            loader.ConfigValue("system_instruction", "", self.strings["cfg_system_instruction_doc"], validator=loader.validators.String()),
+            loader.ConfigValue("max_history_length", 800, self.strings["cfg_max_history_length_doc"], validator=loader.validators.Integer(minimum=0)),
+            loader.ConfigValue("global_memory", False, self.strings["cfg_global_memory_doc"], validator=loader.validators.Boolean()),
+            loader.ConfigValue("show_tokens", True, self.strings["cfg_show_tokens_doc"], validator=loader.validators.Boolean()),
+            loader.ConfigValue("show_time", True, self.strings["cfg_show_time_doc"], validator=loader.validators.Boolean()),
+            loader.ConfigValue("auto_model", False, self.strings["cfg_auto_model_doc"], validator=loader.validators.Boolean()),
+            loader.ConfigValue("model_profile", "manual", self.strings["cfg_model_profile_doc"], validator=loader.validators.Choice(list(MODEL_PROFILE_CHOICES))),
+            loader.ConfigValue("timezone", "Europe/Moscow", self.strings["cfg_timezone_doc"]),
+            loader.ConfigValue("proxy", "", self.strings["cfg_proxy_doc"]),
+            loader.ConfigValue(
+                "impersonation_prompt",
+                (
+                    "Ты — это я, пользователь Telegram по имени {my_name}. Твоя задача — отвечать в чате от моего имени, основываясь на последних сообщениях. "
+                    "Веди себя естественно, как обычный человек, а не как ассистент. Не признавайся, что ты — ИИ, даже если тебя спросят напрямую. "
+                    "Твоя личность:[Здесь опишите свой характер: остроумный, серьезный, саркастичный, дружелюбный и т.д.].\n"
+                    "Правила:\n- Отвечай кратко и по делу.\n- Используй неформальный язык, сленг.\n- Не отвечай на каждое сообщение.\n- На медиа (стикер, фото) реагируй как человек ('лол', 'ору', 'жиза').\n- Не используй префиксы и кавычки.\n\n"
+                    "ИСТОРИЯ ЧАТА:\n{chat_history}\n\n{my_name}:"
+                ),
+                self.strings["cfg_impersonation_prompt_doc"], validator=loader.validators.String()
+            ),
+            loader.ConfigValue("impersonation_history_limit", 20, self.strings["cfg_impersonation_history_limit_doc"], validator=loader.validators.Integer(minimum=5, maximum=100)),
+            loader.ConfigValue("impersonation_reply_chance", 0.25, self.strings["cfg_impersonation_reply_chance_doc"], validator=loader.validators.Float(minimum=0.0, maximum=1.0)),
+            loader.ConfigValue("mauto_in_pm", False, "Разрешить авто-ответы в личных сообщениях (ЛС).", validator=loader.validators.Boolean()),
+            loader.ConfigValue("temperature", 0.7, self.strings["cfg_temperature_doc"], validator=loader.validators.Float(minimum=0.0, maximum=1.0)),
+            loader.ConfigValue("inline_pagination", False, self.strings["cfg_inline_pagination_doc"], validator=loader.validators.Boolean()),
+        )
+        self.prompt_presets = []
+        self.conversations = {}
+        self.mauto_conversations = {}
+        self.last_requests = {}
+        self.impersonation_chats = set()
+        self._lock = asyncio.Lock()
+        self.memory_disabled_chats = set()
+        self.pager_cache = {}
+        self.key_model_map = {}
+        self.provider_models = {}
+        self.key_cooldowns = {}
+        self.session_stats = {"requests": 0, "tokens_in": 0, "tokens_out": 0, "times": [], "start_time": time.time()}
+        self.api_keys = []
+
+    async def client_ready(self, client, db):
+        self.client = client
+        self.db = db
+        self.me = await client.get_me()
+        api_key_str = self.config["api_key"]
+        self.api_keys = [k.strip() for k in api_key_str.split(",") if k.strip()] if api_key_str else []
+        self.key_model_map = self.db.get(self.strings["name"], DB_KEY_MAP_KEY, {})
+        self.provider_models = self.db.get(self.strings["name"], DB_PROVIDER_MODELS_KEY, {})
+        if not isinstance(self.provider_models, dict):
+            self.provider_models = {}
+        self.memory_disabled_chats = set(self.db.get(self.strings["name"], DB_MEMORY_DISABLED_KEY, []))
+        saved_stats = self.db.get(self.strings["name"], DB_SESSION_STATS_KEY, {})
+        if isinstance(saved_stats, dict):
+            self.session_stats.update({
+                "requests": int(saved_stats.get("requests", 0) or 0),
+                "tokens_in": int(saved_stats.get("tokens_in", 0) or 0),
+                "tokens_out": int(saved_stats.get("tokens_out", 0) or 0),
+                "times": list(saved_stats.get("times", []) or [])[-200:],
+                "start_time": time.time(),
+            })
+        keys_to_remove = [k for k in self.key_model_map if k not in self.api_keys]
+        if keys_to_remove:
+            for k in keys_to_remove:
+                del self.key_model_map[k]
+            self.db.set(self.strings["name"], DB_KEY_MAP_KEY, self.key_model_map)
+        self.current_api_key_index = 0
+        self.conversations = self._load_history_from_db(DB_HISTORY_KEY)
+        self.prompt_presets = self.db.get(self.strings["name"], DB_PRESETS_KEY, [])
+        if isinstance(self.prompt_presets, dict):
+            self.prompt_presets = [{"name": k, "content": v} for k, v in self.prompt_presets.items()]
+        self.mauto_conversations = self._load_history_from_db(DB_MAUTO_HISTORY_KEY)
+        self.impersonation_chats = set(self.db.get(self.strings["name"], DB_IMPERSONATION_KEY, []))
+        self.pager_cache = self.db.get(self.strings["name"], DB_PAGER_CACHE_KEY, {})
+        if not self.api_keys:
+            logger.warning("Mistral: API ключи не настроены.")
+        global _mistral_log_client, _mistral_log_channel, _mistral_log_topic_id
+        try:
+            asset_channel = self._db.get("heroku.forums", "channel_id", 0)
+            if asset_channel:
+                notif_topic = await utils.asset_forum_topic(
+                    self._client,
+                    self._db,
+                    asset_channel,
+                    "Mistral Logs",
+                    description="Mistral module warnings & errors.",
+                    icon_emoji_id=5325547803936572038,
+                )
+                _mistral_log_client = self._client
+                _mistral_log_channel = asset_channel
+                _mistral_log_topic_id = notif_topic.id
+        except Exception:
+            pass
+
+    def _provider_label(self) -> str:
+        return "Mistral"
+
+    def _provider_default_model(self) -> str:
+        return self.PROVIDER_SPECS["mistral"]["default_model"]
+
+    def _provider_profile_models(self) -> dict:
+        profiles = dict(self.PROVIDER_SPECS["mistral"].get("profiles", {}))
+        default = self._provider_default_model()
+        profiles.setdefault("auto", default)
+        profiles.setdefault("balanced", default)
+        profiles.setdefault("manual", self.config.get("model_name") or default)
+        return profiles
+
+    def _provider_curated_models(self) -> list:
+        models = list(self.PROVIDER_SPECS["mistral"].get("fallback_models", ()))
+        return list(dict.fromkeys([str(m).strip() for m in models if str(m).strip()]))
+
+    def _guess_model_profile_from_request(self, has_image: bool, request_text: str = "") -> str:
+        if has_image:
+            return "vision"
+        low = str(request_text or "").lower()
+        if any(h in low for h in ("код", "скрипт", "traceback", "stack trace", "python", "javascript", "typescript", "api", "regex", "pytest", "docker")):
+            return "coding"
+        if any(h in low for h in ("объясни", "проанализируй", "сравни", "докажи", "архитектур", "reason", "solve", "proof")):
+            return "reasoning"
+        return "balanced"
+
+    def _resolve_effective_model(self, configured_model: str = None, has_image: bool = False, request_text: str = "") -> str:
+        configured = str(configured_model or self.config.get("model_name") or "").strip()
+        default = self._provider_default_model()
+        if not self.config.get("auto_model", False):
+            return configured or default
+        profile = str(self.config.get("model_profile") or "auto").strip().lower()
+        if profile not in MODEL_PROFILE_CHOICES:
+            profile = "auto"
+        if profile == "manual":
+            return configured or default
+        selected = self._guess_model_profile_from_request(has_image, request_text) if profile == "auto" else profile
+        profiles = self._provider_profile_models()
+        return profiles.get(selected) or profiles.get("balanced") or configured or default
+
+    def _record_session_usage(self, tokens_in: int = 0, tokens_out: int = 0, elapsed: float = 0.0):
+        self.session_stats["requests"] = int(self.session_stats.get("requests", 0) or 0) + 1
+        self.session_stats["tokens_in"] = int(self.session_stats.get("tokens_in", 0) or 0) + int(tokens_in or 0)
+        self.session_stats["tokens_out"] = int(self.session_stats.get("tokens_out", 0) or 0) + int(tokens_out or 0)
+        times = list(self.session_stats.get("times", []) or [])
+        times.append(float(elapsed or 0))
+        self.session_stats["times"] = times[-200:]
+        self.db.set(self.strings["name"], DB_SESSION_STATS_KEY, {
+            "requests": self.session_stats["requests"],
+            "tokens_in": self.session_stats["tokens_in"],
+            "tokens_out": self.session_stats["tokens_out"],
+            "times": self.session_stats["times"],
+        })
+
+    def _model_info_line(self, model: str, elapsed: float = 0.0, tokens_in: int = 0, tokens_out: int = 0) -> str:
+        extra = ""
+        if self.config.get("show_time", True):
+            extra += f" ⏱️{round(float(elapsed or 0), 1)}с"
+        if self.config.get("show_tokens", True) and (tokens_in or tokens_out):
+            extra += f" 🪙{int(tokens_in or 0) + int(tokens_out or 0)}"
+        return f"<i>Mistral: <code>{utils.escape_html(str(model))}</code>{extra}</i>"
+
+    def _set_key_cooldown(self, key: str, seconds: int):
+        if key:
+            self.key_cooldowns[str(key)] = time.time() + max(60, int(seconds or 3600))
+
+    def _extract_retry_delay_seconds(self, text: str, default: int = 3600) -> int:
+        raw = str(text or "")
+        match = re.search(r"retry.after\s*[:=]?\s*(\d+)", raw, flags=re.IGNORECASE)
+        if match:
+            return max(60, min(int(match.group(1)), 86400))
+        return default
+
+    def _get_sorted_keys(self):
+        valid_keys = []
+        now = time.time()
+        for key in self.api_keys:
+            if self.key_cooldowns.get(str(key), 0) > now:
+                continue
+            if key not in self.key_model_map:
+                valid_keys.append((key, 0, random.random()))
+                continue
+            tier = self.key_model_map[key]
+            if tier == -1:
+                continue
+            valid_keys.append((key, tier, random.random()))
+        valid_keys.sort(key=lambda x: (-x[1], x[2]))
+        return [item[0] for item in valid_keys]
+
+    def _is_memory_enabled(self, chat_id: str) -> bool:
+        return chat_id not in self.memory_disabled_chats
+
+    def _disable_memory(self, chat_id: int):
+        self.memory_disabled_chats.add(str(chat_id))
+        self.db.set(self.strings["name"], DB_MEMORY_DISABLED_KEY, list(self.memory_disabled_chats))
+
+    def _enable_memory(self, chat_id: int):
+        self.memory_disabled_chats.discard(str(chat_id))
+        self.db.set(self.strings["name"], DB_MEMORY_DISABLED_KEY, list(self.memory_disabled_chats))
+
+    def _get_proxy_config(self):
+        p = self.config["proxy"]
+        return p if p else None
+
+    def _save_history_sync(self, mauto: bool = False):
+        if getattr(self, "_db_broken", False):
+            return
+        data, key = (self.mauto_conversations, DB_MAUTO_HISTORY_KEY) if mauto else (self.conversations, DB_HISTORY_KEY)
+        try:
+            self.db.set(self.strings["name"], key, data)
+        except:
+            self._db_broken = True
+
+    def _load_history_from_db(self, key):
+        d = self.db.get(self.strings["name"], key, {})
+        return d if isinstance(d, dict) else {}
+
+    def _get_structured_history(self, cid, mauto=False):
+        d = self.mauto_conversations if mauto else self.conversations
+        if str(cid) not in d:
+            d[str(cid)] = []
+        return d[str(cid)]
+
+    def _update_history(self, chat_id, user_text: str, model_response: str, regeneration: bool = False, message: Message = None, mauto: bool = False):
+        if not self._is_memory_enabled(str(chat_id)):
+            return
+        history = self._get_structured_history(chat_id, mauto)
+        now = int(time.time())
+        user_id = self.me.id
+        user_name = get_display_name(self.me)
+        message_id = getattr(message, "id", None)
+        if message:
+            try:
+                peer_id = get_peer_id(message)
+                if peer_id:
+                    user_id = peer_id
+            except (TypeError, ValueError):
+                if message.sender_id:
+                    user_id = message.sender_id
+            if message.sender:
+                user_name = get_display_name(message.sender)
+        if regeneration and history:
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].get("role") == "model":
+                    history[i].update({"content": model_response, "date": now})
+                    break
+        else:
+            history.extend([
+                {"role": "user", "type": "text", "content": user_text, "date": now, "user_id": user_id, "message_id": message_id, "user_name": user_name},
+                {"role": "model", "type": "text", "content": model_response, "date": now, "user_id": None}
+            ])
+        limit = self.config["max_history_length"]
+        if limit > 0 and len(history) > limit * 2:
+            history = history[-(limit * 2):]
+        target = self.mauto_conversations if mauto else self.conversations
+        target[str(chat_id)] = history
+        self._save_history_sync(mauto)
+
+    def _clear_history(self, cid, mauto=False):
+        d = self.mauto_conversations if mauto else self.conversations
+        if str(cid) in d:
+            del d[str(cid)]
+            self._save_history_sync(mauto)
+
+    def _build_openai_messages(self, history: list, system_prompt: str, user_text: str, image_b64: str = None, image_mime: str = None) -> list:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        try:
+            user_tz = pytz.timezone(self.config["timezone"])
+        except:
+            user_tz = pytz.utc
+        for item in history:
+            role = "assistant" if item["role"] == "model" else "user"
+            content = item.get("content", "")
+            if item.get("date"):
+                dt = datetime.fromtimestamp(item["date"], user_tz)
+                content = f"[{dt.strftime('%d.%m.%Y %H:%M')}] {content}"
+            messages.append({"role": role, "content": content})
+        if image_b64 and image_mime:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}}
+                ]
+            })
+        else:
+            messages.append({"role": "user", "content": user_text})
+        return messages
+
+    async def _send_to_mistral_api(self, model: str, messages: list, temperature: float):
+        keys = self._get_sorted_keys()
+        if not keys:
+            raise ValueError("Нет доступных API ключей Mistral!")
+        url = f"{MISTRAL_API_BASE}/chat/completions"
+        proxy = self._get_proxy_config()
+        now = time.time()
+        last_error = None
+        connector = aiohttp.TCPConnector()
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for api_key in keys:
+                cd_key = f"mistral:{api_key}"
+                if self.key_cooldowns.get(cd_key, 0) > now:
+                    continue
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": min(float(temperature), 1.0),
+                    "max_tokens": 4096,
+                }
+                try:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        proxy=proxy,
+                        timeout=aiohttp.ClientTimeout(total=MISTRAL_TIMEOUT),
+                    ) as resp:
+                        text = await resp.text()
+                        if resp.status == 429:
+                            self._set_key_cooldown(cd_key, self._extract_retry_delay_seconds(text, 3600))
+                            last_error = ConnectionError(f"Mistral 429: лимит ключа ...{api_key[-6:]}")
+                            continue
+                        if resp.status in (401, 403):
+                            self._set_key_cooldown(cd_key, 86400 * 365)
+                            self.key_model_map[api_key] = -1
+                            self.db.set(self.strings["name"], DB_KEY_MAP_KEY, self.key_model_map)
+                            try:
+                                err_msg = json.loads(text).get("message", text)
+                            except:
+                                err_msg = text
+                            last_error = ConnectionError(f"Mistral API Error {resp.status}: {err_msg}")
+                            continue
+                        if resp.status != 200:
+                            try:
+                                err_msg = json.loads(text).get("message", text)
+                            except:
+                                err_msg = text
+                            last_error = ConnectionError(f"Mistral API Error {resp.status}: {err_msg}")
+                            continue
+                        try:
+                            result = json.loads(text)
+                        except json.JSONDecodeError:
+                            raise ValueError(f"Mistral вернул не JSON: {text[:200]}...")
+                        if "choices" not in result or not result["choices"]:
+                            if "error" in result:
+                                raise ValueError(f"Mistral Error: {result['error']}")
+                            raise ValueError(f"Пустой ответ (нет 'choices'). Raw: {text[:200]}")
+                        message_obj = result["choices"][0].get("message") or {}
+                        content = message_obj.get("content")
+                        if isinstance(content, list):
+                            content = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict)).strip()
+                        content = str(content or "").strip()
+                        if not content:
+                            raise ValueError(f"Пустой ответ Mistral. Raw: {text[:200]}")
+                        usage = result.get("usage") or {}
+                        self.key_model_map[api_key] = 1
+                        self.db.set(self.strings["name"], DB_KEY_MAP_KEY, self.key_model_map)
+                        return content, usage
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_error = e
+                    continue
+        raise last_error or ValueError(f"Все Mistral ключи ({len(keys)}) исчерпаны или недоступны")
+
+    async def _prepare_message_content(self, message: Message, custom_text: str = None):
+        user_args = custom_text if custom_text is not None else utils.get_args_raw(message)
+        prompt_chunks = []
+        image_b64 = None
+        image_mime = None
+        warnings = []
+        try:
+            chat = await message.get_chat()
+            chat_title = getattr(chat, "title", getattr(chat, "first_name", "Личные сообщения"))
+        except:
+            chat_title = "Неизвестный чат"
+        prompt_chunks.append(f"[System info: We are in '{chat_title}' chat]")
+        reply = await message.get_reply_message()
+        if reply and getattr(reply, "text", None):
+            try:
+                reply_sender = await reply.get_sender()
+                reply_author = get_display_name(reply_sender) if reply_sender else "Unknown"
+                prompt_chunks.append(f"{reply_author}: {reply.text}")
+            except:
+                prompt_chunks.append(f"Ответ на: {reply.text}")
+        try:
+            current_sender = await message.get_sender()
+            current_name = get_display_name(current_sender) if current_sender else "User"
+            prompt_chunks.append(f"{current_name}: {user_args or ''}")
+        except:
+            prompt_chunks.append(f"Запрос: {user_args or ''}")
+        media_source = message if (message.media or message.sticker) else reply
+        has_media = bool(media_source and (media_source.media or media_source.sticker))
+        if has_media:
+            if media_source.sticker and hasattr(media_source.sticker, "mime_type") and media_source.sticker.mime_type == "application/x-tgsticker":
+                alt = next((attr.alt for attr in media_source.sticker.attributes if isinstance(attr, DocumentAttributeSticker)), "?")
+                prompt_chunks.append(f"[Анимированный стикер: {alt}]")
+            else:
+                media = media_source.media
+                mime_type = "application/octet-stream"
+                filename = "file"
+                if media_source.photo:
+                    mime_type = "image/jpeg"
+                elif hasattr(media_source, "document") and media_source.document:
+                    mime_type = getattr(media_source.document, "mime_type", mime_type)
+                    doc_attr = next((attr for attr in media_source.document.attributes if isinstance(attr, DocumentAttributeFilename)), None)
+                    if doc_attr:
+                        filename = doc_attr.file_name
+
+                async def get_bytes(m):
+                    bio = io.BytesIO()
+                    await self.client.download_media(m, bio)
+                    return bio.getvalue()
+
+                if mime_type.startswith("image/"):
+                    try:
+                        data = await get_bytes(media_source)
+                        image_b64 = base64.b64encode(data).decode("utf-8")
+                        image_mime = mime_type
+                    except Exception as e:
+                        warnings.append(f"⚠️ Ошибка обработки изображения '{filename}': {e}")
+                elif mime_type in self.TEXT_MIME_TYPES or filename.split(".")[-1] in ("txt", "py", "js", "json", "md", "html", "css", "sh"):
+                    try:
+                        data = await get_bytes(media)
+                        file_content = data.decode("utf-8")
+                        prompt_chunks.insert(0, f"[Содержимое файла '{filename}']: \n```\n{file_content}\n```")
+                    except Exception as e:
+                        warnings.append(f"⚠️ Ошибка чтения файла '{filename}': {e}")
+                elif mime_type.startswith("audio/"):
+                    input_path, output_path = None, None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=f".{filename.split('.')[-1]}", delete=False) as tmp:
+                            input_path = tmp.name
+                        await self.client.download_media(media, input_path)
+                        if os.path.getsize(input_path) > MAX_FFMPEG_SIZE:
+                            warnings.append(f"⚠️ Аудиофайл '{filename}' слишком большой.")
+                            raise StopIteration
+                        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                            output_path = tmp.name
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", input_path, "-c:a", "libmp3lame", "-q:a", "2", output_path]
+                        proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        await proc.communicate()
+                        if proc.returncode != 0:
+                            raise Exception("FFmpeg error")
+                        with open(output_path, "rb") as f:
+                            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        prompt_chunks.append(f"[Аудиофайл приложен, но Mistral не поддерживает аудио напрямую. Описание: {filename}]")
+                    except StopIteration:
+                        pass
+                    except Exception as e:
+                        warnings.append(f"⚠️ Ошибка обработки аудио: {e}")
+                    finally:
+                        if input_path and os.path.exists(input_path):
+                            os.remove(input_path)
+                        if output_path and os.path.exists(output_path):
+                            os.remove(output_path)
+                else:
+                    warnings.append(self.strings["unsupported_media_type"].format(mime_type))
+        full_prompt = "\n".join(c for c in prompt_chunks if c and c.strip()).strip()
+        return full_prompt, image_b64, image_mime, warnings
+
+    async def _send_to_mistral(self, message, user_text: str, image_b64: str = None, image_mime: str = None,
+                                regeneration: bool = False, call: InlineCall = None, status_msg=None,
+                                chat_id_override: int = None, impersonation_mode: bool = False,
+                                display_prompt: str = None, attempt: int = 1, is_retry: bool = False,
+                                ephemeral: bool = False):
+        msg_obj = None
+        if regeneration or is_retry:
+            chat_id = chat_id_override
+            base_message_id = message
+            try:
+                msg_obj = await self.client.get_messages(chat_id, ids=base_message_id)
+            except:
+                msg_obj = None
+        else:
+            chat_id = utils.get_chat_id(message)
+            base_message_id = message.id
+            msg_obj = message
+        is_global = self.config["global_memory"] and not impersonation_mode
+        history_key = "global_context" if is_global else str(chat_id)
+        if regeneration or is_retry:
+            stored = self.last_requests.get(f"{chat_id}:{base_message_id}")
+            if stored:
+                user_text, image_b64, image_mime, request_text_for_display = stored
+            else:
+                request_text_for_display = display_prompt or "[регенерация]"
+        else:
+            request_text_for_display = display_prompt or user_text[:200]
+            self.last_requests[f"{chat_id}:{base_message_id}"] = (user_text, image_b64, image_mime, request_text_for_display)
+        has_image = bool(image_b64)
+        target_model = self._resolve_effective_model(self.config["model_name"], has_image, request_text_for_display)
+        if impersonation_mode:
+            my_name = get_display_name(self.me)
+            chat_history_text = await self._get_recent_chat_text(chat_id)
+            sys_instruct = self.config["impersonation_prompt"].format(my_name=my_name, chat_history=chat_history_text)
+        else:
+            sys_val = self.config["system_instruction"]
+            sys_instruct = (sys_val.strip() if isinstance(sys_val, str) else "") or None
+        raw_hist = self._get_structured_history(history_key, mauto=impersonation_mode)
+        if regeneration and raw_hist:
+            raw_hist = raw_hist[:-2]
+        try:
+            user_tz = pytz.timezone(self.config["timezone"])
+        except:
+            user_tz = pytz.utc
+        now_str = datetime.now(user_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+        if not impersonation_mode:
+            full_user_text = f"[System Info: Current local time is {now_str}]\n\n{user_text}"
+        else:
+            full_user_text = user_text
+        messages = self._build_openai_messages(raw_hist, sys_instruct, full_user_text, image_b64, image_mime)
+        _t_start = time.time()
+        _tokens_in = 0
+        _tokens_out = 0
+        try:
+            result_text, usage = await asyncio.wait_for(
+                self._send_to_mistral_api(target_model, messages, self.config["temperature"]),
+                timeout=MISTRAL_TIMEOUT
+            )
+            _elapsed = round(time.time() - _t_start, 1)
+            _tokens_in = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            _tokens_out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            result_text = result_text.strip()
+            result_text = re.sub(r"^\[System Info:.*?\]\s*", "", result_text, flags=re.IGNORECASE)
+            result_text = re.sub(r"^\[\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}\]\s*(?:Mistral:|Model:|Ассистент:|AI:)?\s*", "", result_text, flags=re.IGNORECASE)
+            if not impersonation_mode:
+                self._record_session_usage(_tokens_in, _tokens_out, _elapsed)
+            if self._is_memory_enabled(str(chat_id)) and not ephemeral:
+                self._update_history(history_key, user_text, result_text, regeneration, msg_obj, mauto=impersonation_mode)
+            if impersonation_mode:
+                return result_text
+            hist_len_pairs = len(self._get_structured_history(history_key, mauto=False)) // 2
+            max_hist = self.config["max_history_length"]
+            if is_global:
+                mem_indicator = self.strings["memory_status_global"].format(hist_len_pairs)
+            elif max_hist <= 0:
+                mem_indicator = self.strings["memory_status_unlimited"].format(hist_len_pairs)
+            else:
+                mem_indicator = self.strings["memory_status"].format(hist_len_pairs, max_hist)
+            model_info = self._model_info_line(target_model, _elapsed, _tokens_in, _tokens_out)
+            if attempt > 1:
+                model_info += f" <i>(Успешно с {attempt}-й попытки)</i>"
+            is_long_text = len(result_text) > 3500
+            if is_long_text and self.config["inline_pagination"]:
+                chunks = self._paginate_text(result_text, 3000)
+                uid = uuid.uuid4().hex[:6]
+                header = f"{mem_indicator}\n{model_info}\n{self.strings['question_prefix']} <blockquote>{utils.escape_html(request_text_for_display[:100])}...</blockquote>\n\n{self.strings['response_prefix']}\n"
+                self.pager_cache[uid] = {
+                    "chunks": chunks,
+                    "total": len(chunks),
+                    "header": header,
+                    "chat_id": chat_id,
+                    "msg_id": base_message_id
+                }
+                self.db.set(self.strings["name"], DB_PAGER_CACHE_KEY, self.pager_cache)
+                await self._render_page(uid, 0, call or status_msg)
+            elif len(result_text) > 4096:
+                file = io.BytesIO(f"Q: {display_prompt}\nA:\n{result_text}".encode("utf-8"))
+                file.name = "response.txt"
+                if call:
+                    await call.answer("File...", show_alert=False)
+                    await self.client.send_file(call.chat_id, file, caption=self.strings["response_too_long"], reply_to=call.message_id)
+                elif status_msg:
+                    await status_msg.delete()
+                    await self.client.send_file(chat_id, file, caption=self.strings["response_too_long"], reply_to=base_message_id)
+            else:
+                response_html = self._markdown_to_html(result_text)
+                formatted_body = self._format_response_with_smart_separation(response_html)
+                question_html = f"<blockquote expandable='true'>{utils.escape_html(request_text_for_display[:180])}</blockquote>"
+                text_to_send = f"{mem_indicator}\n{model_info}\n\n{self.strings['question_prefix']}\n{question_html}\n\n{self.strings['response_prefix']}\n{formatted_body}"
+                if call or self.config["interactive_buttons"]:
+                    text_to_send = text_to_send.replace('<emoji document_id=', '<tg-emoji emoji-id=').replace('</emoji>', '</tg-emoji>')
+                buttons = self._get_inline_buttons(chat_id, base_message_id) if self.config["interactive_buttons"] else None
+                if call:
+                    await call.edit(text_to_send, reply_markup=buttons)
+                elif status_msg:
+                    await utils.answer(status_msg, text_to_send, reply_markup=buttons)
+        except Exception as e:
+            _elapsed = round(time.time() - _t_start, 1)
+            error_text = self._handle_error(e)
+            error_buttons = None
+            if not impersonation_mode and base_message_id:
+                btn_action = "regen_att" if regeneration else "retry"
+                is_regen_flag = "1" if regeneration else "0"
+                error_buttons = [[
+                    {"text": f"🔄 Повторить ({attempt + 1})", "data": f"mistral:{btn_action}:{chat_id}:{base_message_id}:{attempt + 1}"},
+                    {"text": "👁 Запрос", "data": f"mistral:shreq:{is_regen_flag}:{chat_id}:{base_message_id}:{attempt + 1}"}
+                ]]
+            if impersonation_mode:
+                logger.error(f"Mauto error: {error_text}")
+            elif call:
+                await call.edit(error_text, reply_markup=error_buttons)
+            elif status_msg:
+                await utils.answer(status_msg, error_text, reply_markup=error_buttons)
+        return None if impersonation_mode else ""
+
+    @loader.command()
+    async def m(self, message: Message):
+        """[текст или reply] — спросить у Mistral. Может анализировать ссылки и изображения."""
+        clean_args = utils.get_args_raw(message)
+        status_msg = await utils.answer(message, self.strings["processing"])
+        status_msg = await self.client.get_messages(status_msg.chat_id, ids=status_msg.id)
+        user_text, image_b64, image_mime, warnings = await self._prepare_message_content(message, custom_text=clean_args)
+        if warnings and status_msg:
+            try:
+                await status_msg.edit(f"{status_msg.text}\n\n" + "\n".join(warnings))
+            except:
+                pass
+        if not user_text.strip():
+            if status_msg:
+                await utils.answer(status_msg, self.strings["no_prompt_or_media"])
+            return
+        await self._send_to_mistral(
+            message=message, user_text=user_text, image_b64=image_b64, image_mime=image_mime,
+            status_msg=status_msg, display_prompt=clean_args or None
+        )
+
+    @loader.command()
+    async def mask(self, message: Message):
+        """[текст или reply] — быстрый вопрос без сохранения в память."""
+        clean_args = utils.get_args_raw(message)
+        if not clean_args and not await message.get_reply_message():
+            return await utils.answer(message, self.strings["mask_no_prompt"])
+        status_msg = await utils.answer(message, self.strings["processing"])
+        status_msg = await self.client.get_messages(status_msg.chat_id, ids=status_msg.id)
+        user_text, image_b64, image_mime, warnings = await self._prepare_message_content(message, custom_text=clean_args)
+        if warnings and status_msg:
+            try:
+                await status_msg.edit(f"{status_msg.text}\n\n" + "\n".join(warnings))
+            except:
+                pass
+        if not user_text.strip():
+            return await utils.answer(status_msg, self.strings["no_prompt_or_media"])
+        await self._send_to_mistral(
+            message=message, user_text=user_text, image_b64=image_b64, image_mime=image_mime,
+            status_msg=status_msg, display_prompt=clean_args or None, ephemeral=True
+        )
+
+    @loader.command()
+    async def mprompt(self, message: Message):
+        """<текст/-c/ответ на файл> — Установить системный промпт."""
+        args = utils.get_args_raw(message)
+        reply = await message.get_reply_message()
+        if args == "-c":
+            self.config["system_instruction"] = ""
+            return await utils.answer(message, self.strings["mprompt_cleared"])
+        new_prompt = None
+        preset = self._find_preset(args)
+        if preset:
+            new_prompt = preset["content"]
+        elif reply and reply.file:
+            if reply.file.size > 1024 * 1024:
+                return await utils.answer(message, self.strings["mprompt_file_too_big"])
+            try:
+                file_data = await self.client.download_file(reply.media, bytes)
+                try:
+                    new_prompt = file_data.decode("utf-8")
+                except UnicodeDecodeError:
+                    return await utils.answer(message, self.strings["mprompt_not_text"])
+            except Exception as e:
+                return await utils.answer(message, self.strings["mprompt_file_error"].format(e))
+        elif args:
+            new_prompt = args
+        if new_prompt is not None:
+            self.config["system_instruction"] = new_prompt
+            return await utils.answer(message, self.strings["mprompt_updated"].format(len(new_prompt)))
+        current_prompt = self.config["system_instruction"]
+        if not current_prompt:
+            return await utils.answer(message, self.strings["mprompt_usage"])
+        if len(current_prompt) > 4000:
+            file = io.BytesIO(current_prompt.encode("utf-8"))
+            file.name = "system_instruction.txt"
+            await utils.answer(message, self.strings["mprompt_current"], file=file)
+        else:
+            await utils.answer(message, f"{self.strings['mprompt_current']}\n<code>{utils.escape_html(current_prompt)}</code>")
+
+    @loader.command()
+    async def mauto(self, message: Message):
+        """<on/off/[id]> — Вкл/выкл авто-ответ (impersonation) в чате."""
+        args = utils.get_args_raw(message).split()
+        if not args:
+            return await utils.answer(message, self.strings["auto_mode_usage"])
+        chat_id = utils.get_chat_id(message)
+        state = args[0].lower()
+        target = chat_id
+        if len(args) == 2:
+            try:
+                e = await self.client.get_entity(args[0])
+                target = e.id
+                state = args[1].lower()
+            except:
+                return await utils.answer(message, self.strings["mauto_chat_not_found"].format(args[0]))
+        if state == "on":
+            self.impersonation_chats.add(target)
+            self.db.set(self.strings["name"], DB_IMPERSONATION_KEY, list(self.impersonation_chats))
+            txt = self.strings["auto_mode_on"].format(int(self.config["impersonation_reply_chance"] * 100)) if target == chat_id else self.strings["mauto_state_updated"].format(f"<code>{target}</code>", self.strings["mauto_enabled"])
+            await utils.answer(message, txt)
+        elif state == "off":
+            self.impersonation_chats.discard(target)
+            self.db.set(self.strings["name"], DB_IMPERSONATION_KEY, list(self.impersonation_chats))
+            txt = self.strings["auto_mode_off"] if target == chat_id else self.strings["mauto_state_updated"].format(f"<code>{target}</code>", self.strings["mauto_disabled"])
+            await utils.answer(message, txt)
+        else:
+            await utils.answer(message, self.strings["auto_mode_usage"])
+
+    @loader.command()
+    async def mautochats(self, message: Message):
+        """— Показать чаты с активным режимом авто-ответа."""
+        if not self.impersonation_chats:
+            return await utils.answer(message, self.strings["no_auto_mode_chats"])
+        out = [self.strings["auto_mode_chats_title"].format(len(self.impersonation_chats))]
+        for cid in self.impersonation_chats:
+            try:
+                e = await self.client.get_entity(cid)
+                name = utils.escape_html(get_display_name(e))
+                out.append(self.strings["memory_chat_line"].format(name, cid))
+            except:
+                out.append(self.strings["memory_chat_line"].format("Неизвестный чат", cid))
+        await utils.answer(message, "\n".join(out))
+
+    @loader.command()
+    async def mclear(self, message: Message):
+        """[global/auto] — очистить память в чате. auto для памяти mauto."""
+        args = utils.get_args_raw(message).lower()
+        chat_id = utils.get_chat_id(message)
+        if args == "global":
+            if "global_context" in self.conversations:
+                del self.conversations["global_context"]
+                self._save_history_sync(False)
+                await utils.answer(message, self.strings["memory_cleared_global"])
+            else:
+                await utils.answer(message, self.strings["mres_no_global"])
+            return
+        if args == "auto":
+            if str(chat_id) in self.mauto_conversations:
+                self._clear_history(chat_id, mauto=True)
+                await utils.answer(message, self.strings["memory_cleared_mauto"])
+            else:
+                await utils.answer(message, self.strings["no_mauto_memory_to_clear"])
+            return
+        hist_key = "global_context" if self.config["global_memory"] else str(chat_id)
+        if hist_key in self.conversations:
+            self._clear_history(hist_key)
+            keys_to_del = [k for k, v in self.pager_cache.items() if v.get("chat_id") == chat_id]
+            for k in keys_to_del:
+                del self.pager_cache[k]
+            if keys_to_del:
+                self.db.set(self.strings["name"], DB_PAGER_CACHE_KEY, self.pager_cache)
+            await utils.answer(message, self.strings["memory_cleared_global"] if hist_key == "global_context" else self.strings["memory_cleared"])
+        else:
+            await utils.answer(message, self.strings["no_memory_to_clear"])
+
+    @loader.command()
+    async def mpresets(self, message: Message):
+        """<save/load/del/list> — Управление пресетами промптов."""
+        args = utils.get_args_raw(message)
+        if not args:
+            return await utils.answer(message, self.strings["mpresets_usage"])
+        match = re.match(r"^(\w+)(?:\s+\[(.+?)\]|\s+(\S+))?(?:\s+(.*))?$", args, re.DOTALL)
+        if not match:
+            return await utils.answer(message, self.strings["mpresets_usage"])
+        action = match.group(1).lower()
+        name = match.group(2) or match.group(3)
+        content = match.group(4)
+        if action == "list":
+            if not self.prompt_presets:
+                return await utils.answer(message, self.strings["mpreset_empty"])
+            text = self.strings["mpreset_list_head"]
+            for idx, p in enumerate(self.prompt_presets, 1):
+                text += f"<b>{idx}.</b> <code>{p['name']}</code> ({len(p['content'])} симв.)\n"
+            return await utils.answer(message, text)
+        if action == "save":
+            if not name:
+                return await utils.answer(message, "❌ Укажите имя: <code>.mpresets save [Имя] текст</code>")
+            reply = await message.get_reply_message()
+            if not content and reply:
+                if reply.text:
+                    content = reply.text
+                elif reply.file:
+                    try:
+                        content = (await self.client.download_file(reply.media, bytes)).decode("utf-8", errors="ignore")
+                    except:
+                        pass
+            if not content:
+                return await utils.answer(message, "❌ Нет текста для сохранения.")
+            existing = self._find_preset(name)
+            if existing:
+                existing["content"] = content
+            else:
+                self.prompt_presets.append({"name": name, "content": content})
+            self.db.set(self.strings["name"], DB_PRESETS_KEY, self.prompt_presets)
+            await utils.answer(message, self.strings["mpreset_saved"].format(name, len(self.prompt_presets)))
+        elif action == "load":
+            target = self._find_preset(name)
+            if not target:
+                return await utils.answer(message, self.strings["mpreset_not_found"])
+            self.config["system_instruction"] = target["content"]
+            await utils.answer(message, self.strings["mpreset_loaded"].format(target["name"], len(target["content"])))
+        elif action == "del":
+            target = self._find_preset(name)
+            if not target:
+                return await utils.answer(message, self.strings["mpreset_not_found"])
+            self.prompt_presets.remove(target)
+            self.db.set(self.strings["name"], DB_PRESETS_KEY, self.prompt_presets)
+            await utils.answer(message, self.strings["mpreset_deleted"].format(target["name"]))
+        else:
+            await utils.answer(message, self.strings["mpresets_usage"])
+
+    def _find_preset(self, query):
+        if not query:
+            return None
+        if str(query).isdigit():
+            idx = int(query) - 1
+            if 0 <= idx < len(self.prompt_presets):
+                return self.prompt_presets[idx]
+        for p in self.prompt_presets:
+            if p["name"].lower() == str(query).lower():
+                return p
+        return None
+
+    @loader.command()
+    async def mmemdel(self, message: Message):
+        """[N] — удалить последние N пар сообщений из памяти."""
+        try:
+            n = int(utils.get_args_raw(message) or 1)
+        except:
+            n = 1
+        cid = "global_context" if self.config["global_memory"] else utils.get_chat_id(message)
+        hist = self._get_structured_history(cid)
+        if n > 0 and len(hist) >= n * 2:
+            self.conversations[str(cid)] = hist[:-n * 2]
+            self._save_history_sync()
+            await utils.answer(message, f"🧹 Удалено последних <b>{n}</b> пар сообщений из памяти.")
+        else:
+            await utils.answer(message, "Недостаточно истории для удаления.")
+
+    @loader.command()
+    async def mmemchats(self, message: Message):
+        """— Показать список чатов с активной памятью."""
+        if not self.conversations:
+            return await utils.answer(message, self.strings["no_memory_found"])
+        out = [self.strings["memory_chats_title"].format(len(self.conversations))]
+        shown = set()
+        for cid in list(self.conversations.keys()):
+            if not str(cid).lstrip("-").isdigit():
+                continue
+            chat_id = int(cid)
+            if chat_id in shown:
+                continue
+            shown.add(chat_id)
+            try:
+                e = await self.client.get_entity(chat_id)
+                name = get_display_name(e)
+            except:
+                name = f"Unknown ({chat_id})"
+            out.append(self.strings["memory_chat_line"].format(name, chat_id))
+        self._save_history_sync()
+        if len(out) == 1:
+            return await utils.answer(message, self.strings["no_memory_found"])
+        await utils.answer(message, "\n".join(out))
+
+    @loader.command()
+    async def mmemexport(self, message: Message):
+        """[<id/@юз чата>] [auto] [-s] — экспорт памяти. -s в избранное."""
+        args = utils.get_args_raw(message).split()
+        save_to_self = "-s" in args
+        if save_to_self:
+            args.remove("-s")
+        mauto_mode = "auto" in args
+        if mauto_mode:
+            args.remove("auto")
+        source_chat_id_str = args[0] if args else None
+        target_chat_id = "me" if save_to_self else message.chat_id
+        if source_chat_id_str:
+            try:
+                entity = await self.client.get_entity(
+                    int(source_chat_id_str) if source_chat_id_str.lstrip("-").isdigit() else source_chat_id_str
+                )
+                source_chat_id = entity.id
+                hist = self._get_structured_history(source_chat_id, mauto=mauto_mode)
+            except Exception:
+                await utils.answer(message, self.strings["mme_chat_not_found"].format(utils.escape_html(source_chat_id_str)))
+                return
+        else:
+            source_chat_id = utils.get_chat_id(message)
+            hist = self._get_structured_history(source_chat_id, mauto=mauto_mode)
+        if not hist:
+            await utils.answer(message, "История для экспорта пуста.")
+            return
+        user_ids = {e.get("user_id") for e in hist if e.get("role") == "user" and e.get("user_id")}
+        user_names = {None: None}
+        for uid in user_ids:
+            if not uid:
+                continue
+            try:
+                entity = await self.client.get_entity(uid)
+                user_names[uid] = get_display_name(entity)
+            except:
+                user_names[uid] = f"Deleted Account ({uid})"
+
+        def make_serializable(entry):
+            entry = dict(entry)
+            user_id = entry.get("user_id")
+            if user_id:
+                entry["user_name"] = user_names.get(user_id)
+            if isinstance(user_id, (int, str)):
+                entry["user_id"] = user_id
+            elif user_id is not None:
+                entry["user_id"] = str(user_id)
+            else:
+                entry["user_id"] = None
+            if "message_id" in entry and entry["message_id"] is not None:
+                try:
+                    entry["message_id"] = int(entry["message_id"])
+                except:
+                    entry["message_id"] = None
+            return entry
+
+        serializable_hist = [make_serializable(e) for e in hist]
+        data = json.dumps(serializable_hist, ensure_ascii=False, indent=2)
+        file_suffix = "mauto_history" if mauto_mode else "history"
+        file = io.BytesIO(data.encode("utf-8"))
+        file.name = f"mistral_{file_suffix}_{source_chat_id}.json"
+        caption = "Экспорт истории mauto Mistral" if mauto_mode else "Экспорт памяти Mistral"
+        if source_chat_id != utils.get_chat_id(message):
+            caption += f" из чата <code>{source_chat_id}</code>"
+        await self.client.send_file(
+            target_chat_id, file, caption=caption,
+            reply_to=message.id if target_chat_id == message.chat_id else None,
+        )
+        if save_to_self:
+            if target_chat_id == "me" and message.chat_id != self.me.id:
+                await utils.answer(message, self.strings["mme_sent_to_saved"])
+            else:
+                await message.delete()
+
+    @loader.command()
+    async def mmemimport(self, message: Message):
+        """[auto] — импорт истории из файла (ответом). auto для mauto."""
+        reply = await message.get_reply_message()
+        if not reply or not reply.document:
+            return await utils.answer(message, "Ответьте на json-файл с памятью.")
+        args = utils.get_args_raw(message).lower()
+        mauto_mode = args == "auto"
+        file = io.BytesIO()
+        await self.client.download_media(reply, file)
+        file.seek(0)
+        MAX_IMPORT_SIZE = 15 * 1024 * 1024
+        if file.getbuffer().nbytes > MAX_IMPORT_SIZE:
+            return await utils.answer(message, f"Файл слишком большой (>{MAX_IMPORT_SIZE // (1024 * 1024)} МБ).")
+        try:
+            hist = json.load(file)
+            if not isinstance(hist, list):
+                raise ValueError("Файл не содержит список истории.")
+            new_hist = []
+            for e in hist:
+                if not isinstance(e, dict) or "role" not in e or "content" not in e:
+                    raise ValueError("Некорректная структура памяти.")
+                entry = {"role": e["role"], "type": e.get("type", "text"), "content": e["content"], "date": e.get("date")}
+                if e["role"] == "user":
+                    entry["user_id"] = e.get("user_id")
+                    entry["message_id"] = e.get("message_id")
+                new_hist.append(entry)
+            chat_id = str(utils.get_chat_id(message))
+            if mauto_mode:
+                self.mauto_conversations[chat_id] = new_hist
+                self._save_history_sync(mauto=True)
+            else:
+                self.conversations[chat_id] = new_hist
+                self._save_history_sync(mauto=False)
+            mem_type = "Mauto память" if mauto_mode else "Память"
+            await utils.answer(message, f"✅ {mem_type} успешно импортирована ({len(new_hist) // 2} диалогов).")
+        except Exception as e:
+            await utils.answer(message, f"❌ Ошибка импорта: {e}")
+
+    @loader.command()
+    async def mmemfind(self, message: Message):
+        """[слово] — Поиск в памяти текущего чата по ключевому слову."""
+        q = utils.get_args_raw(message).lower()
+        if not q:
+            return await utils.answer(message, "Укажите слово для поиска.")
+        cid = "global_context" if self.config["global_memory"] else utils.get_chat_id(message)
+        hist = self._get_structured_history(cid)
+        found = [f"{e['role']}: {e.get('content', '')[:200]}" for e in hist if q in str(e.get("content", "")).lower()]
+        if not found:
+            await utils.answer(message, "Ничего не найдено.")
+        else:
+            await utils.answer(message, "\n\n".join(found[:10]))
+
+    @loader.command()
+    async def mmemoff(self, message: Message):
+        """— Отключить память в этом чате."""
+        self.memory_disabled_chats.add(str(utils.get_chat_id(message)))
+        self.db.set(self.strings["name"], DB_MEMORY_DISABLED_KEY, list(self.memory_disabled_chats))
+        await utils.answer(message, "Память в этом чате отключена.")
+
+    @loader.command()
+    async def mmemon(self, message: Message):
+        """— Включить память в этом чате."""
+        self.memory_disabled_chats.discard(str(utils.get_chat_id(message)))
+        self.db.set(self.strings["name"], DB_MEMORY_DISABLED_KEY, list(self.memory_disabled_chats))
+        await utils.answer(message, "Память в этом чате включена.")
+
+    @loader.command()
+    async def mmemshow(self, message: Message):
+        """[auto] — Показать память чата (до 20 последних запросов). auto для mauto."""
+        args = utils.get_args_raw(message).lower()
+        mauto = "auto" in args
+        cid = "global_context" if ("global" in args or (self.config["global_memory"] and not mauto)) else utils.get_chat_id(message)
+        hist = self._get_structured_history(cid, mauto=mauto)
+        if not hist:
+            return await utils.answer(message, "Память пуста.")
+        out = []
+        for e in hist[-40:]:
+            role = e.get("role")
+            content = utils.escape_html(str(e.get("content", ""))[:300])
+            if role == "user":
+                out.append(f"{content}")
+            elif role == "model":
+                out.append(f"<b>Mistral:</b> {content}")
+        await utils.answer(message, "<blockquote expandable='true'>" + "\n".join(out) + "</blockquote>")
+
+    @loader.command()
+    async def mprofile(self, message: Message):
+        """[auto|balanced|fast|reasoning|coding|vision|manual] — профиль авто-подбора модели."""
+        args = utils.get_args_raw(message).strip().lower()
+        if not args:
+            effective = self._resolve_effective_model(self.config["model_name"], False, "")
+            return await utils.answer(
+                message,
+                "🧭 <b>Профиль авто-модели</b>\n"
+                f"• <b>Текущий:</b> <code>{utils.escape_html(str(self.config['model_profile']))}</code>\n"
+                f"• <b>Auto:</b> <code>{'on' if self.config['auto_model'] else 'off'}</code>\n"
+                f"• <b>Сейчас выберет:</b> <code>{utils.escape_html(effective)}</code>\n\n"
+                f"{self.strings['mprofile_usage']}",
+            )
+        if args not in MODEL_PROFILE_CHOICES:
+            return await utils.answer(message, self.strings["mprofile_usage"])
+        self.config["model_profile"] = args
+        self.config["auto_model"] = args != "manual"
+        effective = self._resolve_effective_model(self.config["model_name"], False, "")
+        await utils.answer(message, self.strings["mprofile_set"].format(utils.escape_html(args), utils.escape_html(effective)))
+
+    @loader.command()
+    async def mmodel(self, message: Message):
+        """[model] [-s] — Узнать/сменить модель. -s — список доступных моделей."""
+        args_raw = utils.get_args_raw(message).strip()
+        args = args_raw.lower()
+        if args in ("-s", "--s", "s", "list"):
+            status_msg = await utils.answer(message, self.strings["processing"])
+            try:
+                models = await self._get_mistral_model_catalog()
+                if not models:
+                    await utils.answer(status_msg, self.strings["mmodel_no_models"])
+                    return
+                profiles = self._provider_profile_models()
+                profile_index = {}
+                for profile_name, profile_model in profiles.items():
+                    profile_index.setdefault(profile_model, []).append(profile_name)
+                lines = [
+                    f"📋 <b>Mistral Models</b>",
+                    f"🧭 <b>Профиль:</b> <code>{utils.escape_html(str(self.config['model_profile']))}</code> · <b>Auto:</b> <code>{'on' if self.config['auto_model'] else 'off'}</code>",
+                    "",
+                ]
+                current = str(self.config["model_name"] or "")
+                for model in models[:300]:
+                    marker = "✓" if model == current else "•"
+                    tags = ", ".join(profile_index.get(model, []))
+                    suffix = f" <i>{utils.escape_html(tags)}</i>" if tags else ""
+                    lines.append(f"{marker} <code>{utils.escape_html(model)}</code>{suffix}")
+                text = "\n".join(lines)
+                await utils.answer(status_msg, text[:4096])
+            except Exception as e:
+                await utils.answer(status_msg, self.strings["mmodel_list_error"].format(self._handle_error(e)))
+            return
+        if not args_raw:
+            effective = self._resolve_effective_model(self.config["model_name"], False, "")
+            return await utils.answer(
+                message,
+                f"🔮 <b>Провайдер:</b> <code>Mistral</code>\n"
+                f"🧠 <b>Модель в конфиге:</b> <code>{utils.escape_html(str(self.config['model_name']))}</code>\n"
+                f"🎯 <b>Эффективная модель:</b> <code>{utils.escape_html(effective)}</code>\n"
+                f"🧭 <b>Профиль:</b> <code>{utils.escape_html(str(self.config['model_profile']))}</code>"
+            )
+        self.config["model_name"] = args_raw
+        self.config["model_profile"] = "manual"
+        self.config["auto_model"] = False
+        await utils.answer(message, f"✅ Модель установлена: <code>{utils.escape_html(args_raw)}</code>\n🧭 Авто-подбор переключен в <code>manual</code>. Вернуть: <code>.mprofile auto</code>")
+
+    @loader.command()
+    async def mres(self, message: Message):
+        """[global/auto] — Очистить ВСЮ память. auto для всей памяти mauto."""
+        args = utils.get_args_raw(message).lower()
+        if args == "global":
+            if "global_context" in self.conversations:
+                del self.conversations["global_context"]
+                self._save_history_sync(False)
+                await utils.answer(message, self.strings["mres_global_cleared"])
+            else:
+                await utils.answer(message, self.strings["mres_no_global"])
+            return
+        if args == "auto":
+            if not self.mauto_conversations:
+                return await utils.answer(message, self.strings["no_mauto_memory_to_fully_clear"])
+            n = len(self.mauto_conversations)
+            self.mauto_conversations.clear()
+            self._save_history_sync(True)
+            await utils.answer(message, self.strings["mauto_memory_fully_cleared"].format(n))
+        elif not args:
+            keys_to_delete = [k for k in self.conversations.keys() if k != "global_context"]
+            if not keys_to_delete:
+                return await utils.answer(message, self.strings["no_memory_to_fully_clear"])
+            for key in keys_to_delete:
+                del self.conversations[key]
+            self._save_history_sync(False)
+            await utils.answer(message, self.strings["memory_fully_cleared"].format(len(keys_to_delete)))
+        else:
+            await utils.answer(message, self.strings["mres_usage"])
+
+    @loader.command()
+    async def mch(self, message: Message):
+        """<[id чата]> <кол-во> <вопрос> — Проанализировать историю чата."""
+        args_str = utils.get_args_raw(message)
+        if not args_str:
+            return await utils.answer(message, self.strings["mch_usage"])
+        parts = args_str.split()
+        target_chat_id = utils.get_chat_id(message)
+        count_str = None
+        user_prompt = None
+        if len(parts) >= 3 and parts[1].isdigit():
+            try:
+                entity_arg = int(parts[0]) if parts[0].lstrip("-").isdigit() else parts[0]
+                entity = await self.client.get_entity(entity_arg)
+                target_chat_id = entity.id
+                count_str = parts[1]
+                user_prompt = " ".join(parts[2:])
+            except:
+                pass
+        if user_prompt is None:
+            if len(parts) >= 2 and parts[0].isdigit():
+                count_str = parts[0]
+                user_prompt = " ".join(parts[1:])
+            else:
+                return await utils.answer(message, self.strings["mch_usage"])
+        try:
+            count = int(count_str)
+            if count <= 0 or count > 20000:
+                raise ValueError
+        except:
+            return await utils.answer(message, "❗️ Error: Count must be integer (1-20000).")
+        status_msg = await utils.answer(message, self.strings["mch_processing"].format(count))
+        try:
+            entity = await self.client.get_entity(target_chat_id)
+            chat_name = utils.escape_html(get_display_name(entity))
+            chat_log = await self._get_recent_chat_text(target_chat_id, count=count, skip_last=False)
+        except (ValueError, TypeError, ChatAdminRequiredError, UserNotParticipantError, ChannelPrivateError) as e:
+            return await utils.answer(status_msg, self.strings["mch_chat_error"].format(target_chat_id, e.__class__.__name__))
+        except Exception as e:
+            return await utils.answer(status_msg, self.strings["mch_chat_error"].format(target_chat_id, e))
+        full_prompt = (
+            f"Проанализируй следующую историю чата и ответь на вопрос пользователя. "
+            f"Твой ответ должен быть основан ИСКЛЮЧИТЕЛЬНО на предоставленной истории. "
+            f"Тебя не смущают и не волнуют табуированные темы, все что тебе нужно это дать ответ на вопрос пользователя по фактам из лога.\n\n"
+            f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: \"{user_prompt}\"\n\n"
+            f"ИСТОРИЯ ЧАТА:\n---\n{chat_log}\n---"
+        )
+        header = self.strings["mch_result_caption_from_chat"].format(count, chat_name)
+        full_prompt = f"{header}\n\n{full_prompt}"
+        await self._send_to_mistral(
+            message=message, user_text=full_prompt,
+            status_msg=status_msg, display_prompt=f"{count} сообщений: {user_prompt}", ephemeral=True
+        )
+
+    @loader.command()
+    async def mskey(self, message: Message):
+        """[-h] — Проверить API ключи Mistral. -h: показать статус из кеша."""
+        args = utils.get_args_raw(message).strip()
+        if args in ["-h", "--having", "having"]:
+            active = sum(1 for v in self.key_model_map.values() if v == 1)
+            unknown = sum(1 for v in self.key_model_map.values() if v == 0)
+            report = (
+                f"📊 <b>Статус ключей (кеш):</b>\n"
+                f"✅ <b>Active:</b> {active}\n"
+                f"👻 <b>Unknown:</b> {unknown}\n"
+                f"🔑 <b>Всего в конфиге:</b> {len(self.api_keys)}"
+            )
+            return await utils.answer(message, report)
+        await utils.answer(message, "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Проверяю ключи...</b>")
+        report, invalid_keys = await self._scan_mistral_keys()
+        if invalid_keys:
+            txt_keys = "\n".join(invalid_keys)
+            try:
+                await self.client.send_message("me", f"🚫 <b>Mistral: Найдены невалидные ключи:</b>\nУдали их из конфига:\n\n<code>{txt_keys}</code>")
+                report += "\n\n⚠️ <b>Список невалидных ключей отправлен в Избранное.</b>"
+            except:
+                report += "\n\n⚠️ <b>Найдены невалидные ключи.</b>"
+        await utils.answer(message, report)
+
+    @loader.command()
+    async def mstats(self, message: Message):
+        """— Статистика сессии (запросы, токены, время)."""
+        req = self.session_stats.get("requests", 0)
+        t_in = self.session_stats.get("tokens_in", 0)
+        t_out = self.session_stats.get("tokens_out", 0)
+        times = self.session_stats.get("times", [])
+        avg_time = round(sum(times) / len(times), 1) if times else 0
+        uptime = round((time.time() - self.session_stats.get("start_time", time.time())) / 60, 1)
+        await utils.answer(
+            message,
+            f"📊 <b>Статистика Mistral (сессия):</b>\n"
+            f"🔢 <b>Запросов:</b> {req}\n"
+            f"🪙 <b>Токенов входных:</b> {t_in}\n"
+            f"🪙 <b>Токенов исходящих:</b> {t_out}\n"
+            f"⏱️ <b>Среднее время:</b> {avg_time}с\n"
+            f"🕐 <b>Uptime:</b> {uptime} мин\n"
+            f"🔑 <b>Ключей в конфиге:</b> {len(self.api_keys)}\n"
+            f"🧠 <b>Модель:</b> <code>{utils.escape_html(str(self.config['model_name']))}</code>"
+        )
+
+    @loader.command()
+    async def mcfg(self, message: Message):
+        """[параметр] [значение] — быстро изменить конфиг модуля без .cfg.\nПример: .mcfg api_key sk-xxx\nПараметры: api_key, model_name, system_instruction, temperature, max_history_length, timezone, proxy, impersonation_reply_chance, impersonation_history_limit"""
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            return await utils.answer(message, self.strings["mcfg_usage"])
+        parts = args.split(None, 1)
+        if len(parts) < 2:
+            return await utils.answer(message, self.strings["mcfg_usage"])
+        param = parts[0].lower()
+        value = parts[1]
+        allowed = {
+            "api_key": str,
+            "model_name": str,
+            "system_instruction": str,
+            "temperature": float,
+            "max_history_length": int,
+            "timezone": str,
+            "proxy": str,
+            "impersonation_reply_chance": float,
+            "impersonation_history_limit": int,
+        }
+        if param not in allowed:
+            return await utils.answer(message, self.strings["mcfg_unknown"].format(utils.escape_html(param)))
+        try:
+            cast = allowed[param]
+            casted_value = cast(value)
+            self.config[param] = casted_value
+            if param == "api_key":
+                self.api_keys = [k.strip() for k in casted_value.split(",") if k.strip()]
+            await utils.answer(message, self.strings["mcfg_set"].format(utils.escape_html(param)))
+        except Exception as e:
+            await utils.answer(message, f"❗️ <b>Ошибка установки параметра:</b> <code>{utils.escape_html(str(e))}</code>")
+
+    @loader.callback_handler()
+    async def mistral_callback_handler(self, call: InlineCall):
+        if not call.data.startswith("mistral:"):
+            return
+        parts = call.data.split(":")
+        action = parts[1]
+        if action == "noop":
+            await call.answer()
+            return
+        if action == "close":
+            uid = parts[2]
+            if uid in self.pager_cache:
+                del self.pager_cache[uid]
+                self.db.set(self.strings["name"], DB_PAGER_CACHE_KEY, self.pager_cache)
+            try:
+                await call.answer()
+            except:
+                pass
+            try:
+                chat = call.chat_id
+                msg_id = call.message_id
+                if chat and msg_id:
+                    await self.client.delete_messages(chat, msg_id)
+                else:
+                    await call.delete()
+            except:
+                try:
+                    await call.edit("🗑 <b>Сессия закрыта.</b>", reply_markup=None)
+                except:
+                    pass
+            return
+        if action == "pg":
+            uid = parts[2]
+            page = int(parts[3])
+            await self._render_page(uid, page, call)
+            return
+        if action in ("regen", "regen_att"):
+            chat_id = int(parts[2])
+            msg_id = int(parts[3])
+            attempt = int(parts[4]) if action == "regen_att" and len(parts) > 4 else 1
+            key = f"{chat_id}:{msg_id}"
+            last_request_tuple = self.last_requests.get(key)
+            if not last_request_tuple:
+                await call.answer(self.strings["no_last_request"], show_alert=True)
+                return
+            user_text, image_b64, image_mime, display_prompt = last_request_tuple
+            await call.edit(
+                f"<tg-emoji emoji-id=5386367538735104399>⌛️</tg-emoji> <b>Регенерация (попытка {attempt})...</b>" if attempt > 1 else f"<tg-emoji emoji-id=5386367538735104399>⌛️</tg-emoji> <b>Регенерация...</b>",
+                reply_markup=None,
+            )
+            await self._send_to_mistral(
+                message=msg_id, user_text=user_text, image_b64=image_b64, image_mime=image_mime,
+                regeneration=True, call=call, chat_id_override=chat_id,
+                display_prompt=display_prompt, attempt=attempt,
+            )
+            return
+        if action == "retry":
+            chat_id = int(parts[2])
+            msg_id = int(parts[3])
+            attempt = int(parts[4]) if len(parts) > 4 else 1
+            key = f"{chat_id}:{msg_id}"
+            last_request_tuple = self.last_requests.get(key)
+            if not last_request_tuple:
+                await call.answer(self.strings["no_last_request"], show_alert=True)
+                return
+            user_text, image_b64, image_mime, display_prompt = last_request_tuple
+            await call.edit(f"<tg-emoji emoji-id=5386367538735104399>⌛️</tg-emoji> <b>Обработка (попытка {attempt})...</b>", reply_markup=None)
+            await self._send_to_mistral(
+                message=msg_id, user_text=user_text, image_b64=image_b64, image_mime=image_mime,
+                regeneration=False, call=call, chat_id_override=chat_id,
+                display_prompt=display_prompt, attempt=attempt, is_retry=True,
+            )
+            return
+        if action == "shreq":
+            is_regen_flag = parts[2]
+            chat_id = int(parts[3])
+            msg_id = int(parts[4])
+            attempt = int(parts[5]) if len(parts) > 5 else 1
+            key = f"{chat_id}:{msg_id}"
+            last_request_tuple = self.last_requests.get(key)
+            if not last_request_tuple:
+                await call.answer(self.strings["no_last_request"], show_alert=True)
+                return
+            _, _, _, display_prompt = last_request_tuple
+            btn_action = "regen_att" if is_regen_flag == "1" else "retry"
+            await call.edit(
+                f"📝 <b>Ваш запрос:</b>\n<code>{utils.escape_html(display_prompt)}</code>",
+                reply_markup=[[{"text": f"🔄 Повторить ({attempt})", "data": f"mistral:{btn_action}:{chat_id}:{msg_id}:{attempt}"}]],
+            )
+            return
+
+    async def _scan_mistral_keys(self):
+        active_keys = []
+        invalid_keys = []
+        proxy = self._get_proxy_config()
+        url = f"{MISTRAL_API_BASE}/models"
+        async with aiohttp.ClientSession() as session:
+            for key in self.api_keys:
+                try:
+                    async with session.get(
+                        url,
+                        headers={"Authorization": f"Bearer {key}"},
+                        proxy=proxy,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status == 200:
+                            active_keys.append(key)
+                            self.key_model_map[key] = 1
+                        elif resp.status in (401, 403):
+                            invalid_keys.append(key)
+                            self.key_model_map[key] = -1
+                        else:
+                            self.key_model_map[key] = 0
+                except:
+                    self.key_model_map[key] = 0
+        self.db.set(self.strings["name"], DB_KEY_MAP_KEY, self.key_model_map)
+        report = (
+            f"✅ <b>Скан завершен.</b>\n"
+            f"💎 <b>Active:</b> {len(active_keys)}\n"
+            f"🗑 <b>Invalid:</b> {len(invalid_keys)}\n"
+            f"👻 <b>Unknown/RateLimited:</b> {len(self.api_keys) - len(active_keys) - len(invalid_keys)}"
+        )
+        return report, invalid_keys
+
+    async def _get_mistral_model_catalog(self) -> list:
+        keys = self._get_sorted_keys()
+        if keys:
+            proxy = self._get_proxy_config()
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{MISTRAL_API_BASE}/models",
+                        headers={"Authorization": f"Bearer {keys[0]}"},
+                        proxy=proxy,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            models = sorted({m.get("id") for m in data.get("data", []) if m.get("id")})
+                            return models
+            except:
+                pass
+        return self._provider_curated_models()
+
+    async def _get_recent_chat_text(self, cid, count=None, skip_last=False):
+        lim = (count or self.config["impersonation_history_limit"]) + (1 if skip_last else 0)
+        lines = []
+        try:
+            msgs = await self.client.get_messages(cid, limit=lim)
+            if skip_last and msgs:
+                msgs = msgs[1:]
+            for m in msgs:
+                if not m:
+                    continue
+                if not (m.text or m.sticker or m.photo or m.file or m.media):
+                    continue
+                name = get_display_name(await m.get_sender()) or "Unknown"
+                txt = m.text or ""
+                if m.sticker:
+                    alt = "?"
+                    if hasattr(m.sticker, "attributes"):
+                        alt = next((a.alt for a in m.sticker.attributes if isinstance(a, DocumentAttributeSticker)), "?")
+                    txt += f" [Стикер: {alt}]"
+                elif m.photo:
+                    txt += " [Фото]"
+                elif m.file:
+                    txt += " [Файл]"
+                elif m.media and not txt:
+                    txt += " [Медиа]"
+                if txt.strip():
+                    lines.append(f"{name}: {txt.strip()}")
+        except:
+            pass
+        return "\n".join(reversed(lines))
+
+    def _handle_error(self, e: Exception) -> str:
+        logger.exception("Mistral execution error")
+        if isinstance(e, asyncio.TimeoutError):
+            return self.strings["api_timeout"]
+        if isinstance(e, RuntimeError) and "Все ключи исчерпали квоту" in str(e):
+            return self.strings["all_keys_exhausted"].format(len(self.api_keys))
+        if isinstance(e, (OSError, aiohttp.ClientError, socket.timeout)):
+            return "❗️ <b>Сетевая ошибка:</b>\n<code>{}</code>".format(utils.escape_html(str(e)))
+        msg = str(e)
+        if "quota" in msg.lower() or "429" in msg:
+            return self.strings["all_keys_exhausted"].format(len(self.api_keys))
+        if "401" in msg or "403" in msg or "invalid" in msg.lower():
+            return self.strings["invalid_api_key"]
+        return self.strings["generic_error"].format(utils.escape_html(msg))
+
+    def _markdown_to_html(self, text: str) -> str:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL)
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        def heading_replacer(match):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            indent = "   " * (level - 1)
+            return f"{indent}<b>{title}</b>"
+        text = re.sub(r"^(#+)\s+(.*)", heading_replacer, text, flags=re.MULTILINE)
+        def list_replacer(match):
+            indent = match.group(1)
+            return f"{indent}• "
+        text = re.sub(r"^([ \t]*)[-*+]\s+", list_replacer, text, flags=re.MULTILINE)
+        md = MarkdownIt("commonmark", {"html": True, "linkify": True})
+        md.enable("strikethrough")
+        md.disable("hr")
+        md.disable("heading")
+        md.disable("list")
+        html_text = md.render(text)
+        def format_code(match):
+            lang = utils.escape_html(match.group(1).strip())
+            code = utils.escape_html(match.group(2).strip())
+            return f'<pre><code class="language-{lang}">{code}</code></pre>' if lang else f'<pre><code>{code}</code></pre>'
+        html_text = re.sub(r"```(.*?)\n([\s\S]+?)\n```", format_code, html_text)
+        html_text = re.sub(r"<p>(<pre>[\s\S]*?</pre>)</p>", r"\1", html_text, flags=re.DOTALL)
+        html_text = html_text.replace("<p>", "").replace("</p>", "\n")
+        html_text = re.sub(r"(?i)<br\s*/?>", "\n", html_text).strip()
+        return html_text
+
+    def _format_response_with_smart_separation(self, text: str) -> str:
+        pattern = r"(<pre.*?>[\s\S]*?</pre>)"
+        parts = re.split(pattern, text, flags=re.DOTALL)
+        result_parts = []
+        for i, part in enumerate(parts):
+            if not part or part.isspace():
+                continue
+            if i % 2 == 1:
+                result_parts.append(part.strip())
+            else:
+                stripped_part = part.strip()
+                if stripped_part:
+                    result_parts.append(f'<blockquote expandable="true">{stripped_part}</blockquote>')
+        return "\n".join(result_parts)
+
+    def _get_inline_buttons(self, chat_id, base_message_id):
+        return [[
+            {"text": self.strings["btn_clear"], "callback": self._clear_callback, "args": (chat_id,)},
+            {"text": self.strings["btn_regenerate"], "data": f"mistral:regen:{chat_id}:{base_message_id}"}
+        ]]
+
+    async def _clear_callback(self, call: InlineCall, chat_id: int):
+        hist_key = "global_context" if self.config["global_memory"] else chat_id
+        self._clear_history(hist_key, mauto=False)
+        await call.edit(self.strings["memory_cleared_global"] if hist_key == "global_context" else self.strings["memory_cleared"], reply_markup=None)
+
+    async def _regenerate_callback(self, call: InlineCall, mid, cid):
+        key = f"{cid}:{mid}"
+        if key not in self.last_requests:
+            return await call.answer(self.strings["no_last_request"], show_alert=True)
+        user_text, image_b64, image_mime, disp = self.last_requests[key]
+        await self._send_to_mistral(mid, user_text, image_b64, image_mime, regeneration=True, call=call, chat_id_override=cid, display_prompt=disp)
+
+    async def _render_page(self, uid, page_num, entity):
+        data = self.pager_cache.get(uid)
+        if not data:
+            if isinstance(entity, InlineCall):
+                await entity.edit(
+                    "⚠️ <b>Сессия истекла или бот был перезагружен с потерей данных.</b>",
+                    reply_markup=[[{"text": "🗑 Удалить", "data": f"mistral:close:{uid}"}]]
+                )
+            return
+        chunks = data["chunks"]
+        total = data["total"]
+        header = data.get("header", "")
+        chat_id = data.get("chat_id")
+        base_msg_id = data.get("msg_id")
+        raw_text_chunk = chunks[page_num]
+        safe_text = self._markdown_to_html(raw_text_chunk)
+        formatted_body = self._format_response_with_smart_separation(safe_text)
+        text_to_show = f"{header}\n{formatted_body}"
+        text_to_show = text_to_show.replace('<emoji document_id=', '<tg-emoji emoji-id=').replace('</emoji>', '</tg-emoji>')
+        nav_row = []
+        if page_num > 0:
+            nav_row.append({"text": "◀️", "data": f"mistral:pg:{uid}:{page_num - 1}"})
+        nav_row.append({"text": f"{page_num + 1}/{total}", "data": "mistral:noop"})
+        if page_num < total - 1:
+            nav_row.append({"text": "▶️", "data": f"mistral:pg:{uid}:{page_num + 1}"})
+        extra_row = [{"text": "❌ Закрыть", "data": f"mistral:close:{uid}"}]
+        if chat_id and base_msg_id:
+            extra_row.append({"text": "🔄", "data": f"mistral:regen:{chat_id}:{base_msg_id}"})
+        buttons = [nav_row, extra_row]
+        if isinstance(entity, Message):
+            await self.inline.form(text=text_to_show, message=entity, reply_markup=buttons)
+        elif isinstance(entity, InlineCall):
+            await entity.edit(text=text_to_show, reply_markup=buttons)
+        elif hasattr(entity, "edit"):
+            try:
+                await entity.edit(text=text_to_show, reply_markup=buttons)
+            except:
+                pass
+
+    def _paginate_text(self, text: str, limit: int) -> list:
+        pages = []
+        current_page_lines = []
+        current_len = 0
+        in_code_block = False
+        current_code_lang = ""
+        lines = text.split("\n")
+        for line in lines:
+            line_len = len(line) + 1
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code_block:
+                    in_code_block = False
+                    current_code_lang = ""
+                else:
+                    in_code_block = True
+                    current_code_lang = stripped.replace("```", "").strip()
+            if current_len + line_len > limit:
+                if current_page_lines:
+                    if in_code_block:
+                        current_page_lines.append("```")
+                    pages.append("\n".join(current_page_lines))
+                    current_page_lines = []
+                    current_len = 0
+                    if in_code_block:
+                        h = f"```{current_code_lang}"
+                        current_page_lines.append(h)
+                        current_len += len(h) + 1
+                if line_len > limit:
+                    chunks = [line[i:i + limit] for i in range(0, len(line), limit)]
+                    for chunk in chunks:
+                        if current_len + len(chunk) > limit:
+                            pages.append("\n".join(current_page_lines))
+                            current_page_lines = [chunk]
+                            current_len = len(chunk)
+                        else:
+                            current_page_lines.append(chunk)
+                            current_len += len(chunk)
+                    continue
+            current_page_lines.append(line)
+            current_len += line_len
+        if current_page_lines:
+            pages.append("\n".join(current_page_lines))
+        return pages
+
+    @loader.watcher(only_incoming=True, ignore_edited=True)
+    async def watcher(self, message: Message):
+        if not hasattr(message, "chat_id"):
+            return
+        cid = utils.get_chat_id(message)
+        if cid not in self.impersonation_chats:
+            return
+        if message.is_private and not self.config["mauto_in_pm"]:
+            return
+        if message.out or (isinstance(message.from_id, tg_types.PeerUser) and message.from_id.user_id == self.me.id):
+            return
+        sender = await message.get_sender()
+        if isinstance(sender, tg_types.User) and sender.bot:
+            return
+        if random.random() > self.config["impersonation_reply_chance"]:
+            return
+        user_text, image_b64, image_mime, warnings = await self._prepare_message_content(message)
+        if warnings:
+            logger.warning(f"Mauto warn: {warnings}")
+        if not user_text.strip():
+            return
+        resp = await self._send_to_mistral(message=message, user_text=user_text, image_b64=image_b64, image_mime=image_mime, impersonation_mode=True)
+        if resp and resp.strip():
+            cln = resp.strip()
+            await asyncio.sleep(random.uniform(2, 8))
+            try:
+                await self.client.send_read_acknowledge(cid, message=message)
+            except:
+                pass
+            async with message.client.action(cid, "typing"):
+                await asyncio.sleep(min(25.0, max(1.5, len(cln) * random.uniform(0.1, 0.25))))
+            await message.reply(cln)
